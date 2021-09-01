@@ -4,27 +4,8 @@ import errno
 import argparse
 import numpy as np
 import cv2
-import tensorflow.compat.v1 as tf
-
-#tf.compat.v1.disable_eager_execution()
-
-physical_devices = tf.config.experimental.list_physical_devices('GPU')
-if len(physical_devices) > 0:
-    tf.config.experimental.set_memory_growth(physical_devices[0], True)
-
-def _run_in_batches(f, data_dict, out, batch_size):
-    data_len = len(out)
-    num_batches = int(data_len / batch_size)
-
-    s, e = 0, 0
-    for i in range(num_batches):
-        s, e = i * batch_size, (i + 1) * batch_size
-        batch_data_dict = {k: v[s:e] for k, v in data_dict.items()}
-        out[s:e] = f(batch_data_dict)
-    if e < len(out):
-        batch_data_dict = {k: v[e:] for k, v in data_dict.items()}
-        out[e:] = f(batch_data_dict)
-
+import tensorrt as trt
+import common
 
 def extract_image_patch(image, bbox, patch_shape):
     """Extract image patch from bounding box.
@@ -75,34 +56,28 @@ def extract_image_patch(image, bbox, patch_shape):
 
 class ImageEncoder(object):
 
-    def __init__(self, checkpoint_filename, input_name="images",
-                 output_name="features"):
-        self.session = tf.Session()
-        with tf.gfile.GFile(checkpoint_filename, "rb") as file_handle:
-            graph_def = tf.GraphDef()
-            graph_def.ParseFromString(file_handle.read())
-        tf.import_graph_def(graph_def, name="net")
-        self.input_var = tf.get_default_graph().get_tensor_by_name(
-            "%s:0" % input_name)
-        self.output_var = tf.get_default_graph().get_tensor_by_name(
-            "%s:0" % output_name)
+    def __init__(self, engine_filename, logger):
 
-        assert len(self.output_var.get_shape()) == 2
-        assert len(self.input_var.get_shape()) == 4
-        self.feature_dim = self.output_var.get_shape().as_list()[-1]
-        self.image_shape = self.input_var.get_shape().as_list()[1:]
+        self.engine = common.deserialize_engine_from_file(engine_path=engine_filename, logger=logger)
+        inputs, outputs, bindings, stream = common.allocate_buffers(self.engine)
+        self.inputs = inputs
+        self.outputs = outputs
+        self.bindings = bindings
+        self.stream = stream
+        # Create execution context from engine
+        self.context = self.engine.create_execution_context()
+        self.feature_dim = 128
+        self.image_shape = (128, 64, 3)
 
-    def __call__(self, data_x, batch_size=32):
-        out = np.zeros((len(data_x), self.feature_dim), np.float32)
-        _run_in_batches(
-            lambda x: self.session.run(self.output_var, feed_dict=x),
-            {self.input_var: data_x}, out, batch_size)
+    def __call__(self, bboxes, batch_size=32):
+        np.copyto(self.inputs[0].host, bboxes)
+        # # Do inferences
+        [out]= common.do_inference(self.context, bindings=self.bindings, inputs=self.inputs, outputs=self.outputs, stream=self.stream, batch_size=4)
         return out
 
 
-def create_box_encoder(model_filename, input_name="images",
-                       output_name="features", batch_size=32):
-    image_encoder = ImageEncoder(model_filename, input_name, output_name)
+def create_box_encoder(model_filename, logger, batch_size=32):
+    image_encoder = ImageEncoder(model_filename, logger)
     image_shape = image_encoder.image_shape
 
     def encoder(image, boxes):
@@ -113,6 +88,7 @@ def create_box_encoder(model_filename, input_name="images",
                 print("WARNING: Failed to extract image patch: %s." % str(box))
                 patch = np.random.uniform(
                     0., 255., image_shape).astype(np.uint8)
+            print(patch.shape)
             image_patches.append(patch)
         image_patches = np.asarray(image_patches)
         return image_encoder(image_patches, batch_size)
