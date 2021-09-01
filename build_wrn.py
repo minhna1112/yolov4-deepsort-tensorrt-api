@@ -119,20 +119,23 @@ def residual_block(network: trt.INetworkDefinition, graph_def, input_tensor: trt
     return add_1
 
 def l2_normalization_layer(network: trt.INetworkDefinition, input_tensor: trt.ITensor, eps: float):
-    # (f0, f1, ... fn)-> (f0^2, f1^2, ... fn^2)
-    unsqueezed = network.add_shuffle(input_tensor)
-    unsqueezed.reshape_dims = trt.Dims([128,])
-    # (f0^2 + f1^2 + ... fn^2)
-    dot_prod = network.add_matrix_multiply(input0=unsqueezed.get_output(0), op0=trt.MatrixOperation.VECTOR, 
-                                        input1=unsqueezed.get_output(0), op1=trt.MatrixOperation.VECTOR)
-    norm = network.add_unary(dot_prod.get_output(0), op=trt.UnaryOperation.SQRT)
-    print(unsqueezed.get_output(0).shape)
-    print(norm.get_output(0).shape)
-    denominate = network.add_shuffle(norm.get_output(0))
-    denominate.reshape_dims = trt.Dims([1,])
-    print(denominate.get_output(0).shape)
-    out = network.add_elementwise(unsqueezed.get_output(0), denominate.get_output(0),  trt.ElementWiseOperation.DIV)
-    return out
+    # (128,1, 1) -> (128,)
+    squeezed = network.add_shuffle(input_tensor)
+    squeezed.reshape_dims = trt.Dims([128,])
+    # (f0, f1, ... fn) -> (f0^2 + f1^2 + ... fn^2) (scalar)
+    dot_prod = network.add_matrix_multiply(input0=squeezed.get_output(0), op0=trt.MatrixOperation.VECTOR, 
+                                        input1=squeezed.get_output(0), op1=trt.MatrixOperation.VECTOR)
+    #Unsqueeze to tensor rank 3
+    unsqueezed = network.add_shuffle(dot_prod.get_output(0))
+    unsqueezed.reshape_dims = trt.Dims([1,1,1])
+    # Add non-zero epsilon constant
+    add_6 = network.add_scale(unsqueezed.get_output(0), 
+                        shift=trt.Weights(np.ascontiguousarray(eps, dtype=np.float32)), 
+                        mode=trt.ScaleMode.UNIFORM)
+    #Calculated norm sqrt[(f0^2 + f1^2 + ... fn^2)]
+    norm = network.add_unary(add_6.get_output(0), op=trt.UnaryOperation.SQRT)    
+    
+    return norm
 
 def populate_network(network: trt.INetworkDefinition, graph_def):
     INPUT_W = ModelData.INPUT_SHAPE[1]
@@ -163,16 +166,17 @@ def populate_network(network: trt.INetworkDefinition, graph_def):
     shuffle = network.add_shuffle(res_9.get_output(0))
     shuffle.first_transpose = trt.Permutation([1,2,0])
     #Densely connected: . fc = matmul(x, W.t)  -> 128
-    fc_w = get_weights_from_node(graph_def, 'fc1/weights').T #Weights shape(16384, 128) -> (128, 16384)
+    fc_w = get_weights_from_node(graph_def, 'fc1/weights').T #Weights shape(16384, 128) -> (128, 16384) (KxX row-major order)
     fc_10 = network.add_fully_connected(input=shuffle.get_output(0), num_outputs=128, kernel=fc_w)
     fc_bn = add_batchnorm_2D(network, graph_def, fc_10.get_output(0), 'fc1/fc1', BN_EPSILON, trt.ScaleMode.CHANNEL)
     fc_elu = network.add_activation(fc_bn.get_output(0), trt.ActivationType.ELU)
     #l2-norm Unit Hypersphere
     ball_bn = add_ball_bn(network, graph_def, fc_elu.get_output(0), BN_EPSILON, trt.ScaleMode.CHANNEL)
-    l2_norm = l2_normalization_layer(network, ball_bn.get_output(0), BALL_CONSTANT)
-    #print(ball_bn.get_output(0).shape)
-    network.mark_output(tensor=ball_bn.get_output(0))
-    network.mark_output(tensor=l2_norm.get_output(0))
+    #Calculated l2-norm features output
+    denominator = l2_normalization_layer(network, ball_bn.get_output(0), BALL_CONSTANT)
+    nominator = ball_bn
+    out = network.add_elementwise(nominator.get_output(0), denominator.get_output(0),  trt.ElementWiseOperation.DIV)
+    network.mark_output(tensor=out.get_output(0))
     
 
 def build_engine(weights, max_batch_size):
@@ -187,36 +191,36 @@ def build_engine(weights, max_batch_size):
         return builder.build_engine(network, config)
 
 
-session = tf.Session()
-input_name = 'images'
-output_name = 'features'
+# session = tf.Session()
+# input_name = 'images'
+# output_name = 'features'
 
-checkpoint_filename = './deepsort/mars-small128.pb'
+# checkpoint_filename = './deepsort/mars-small128.pb'
 
-output_node_txt = './nodes.txt'
-graph_def_txt = './graph.txt'
+# output_node_txt = './nodes.txt'
+# graph_def_txt = './graph.txt'
 
-#Read GraphDef from pre-trained protobuf .pb file
-with tf.gfile.GFile(checkpoint_filename, "rb") as file_handle:
-    graph_def = tf.GraphDef()
-    graph_def.ParseFromString(file_handle.read())
-    tf.import_graph_def(graph_def, name="net")
-    input_var = tf.get_default_graph().get_tensor_by_name("%s:0" % input_name)
-    output_var = tf.get_default_graph().get_tensor_by_name("%s:0" % output_name)
+# #Read GraphDef from pre-trained protobuf .pb file
+# with tf.gfile.GFile(checkpoint_filename, "rb") as file_handle:
+#     graph_def = tf.GraphDef()
+#     graph_def.ParseFromString(file_handle.read())
+#     tf.import_graph_def(graph_def, name="net")
+#     input_var = tf.get_default_graph().get_tensor_by_name("%s:0" % input_name)
+#     output_var = tf.get_default_graph().get_tensor_by_name("%s:0" % output_name)
 
-engine = build_engine(graph_def, MAX_BATCH_SIZE)
+# engine = build_engine(graph_def, MAX_BATCH_SIZE)
 
-#common.serialize_engine_to_file(engine, engine_path)
+# common.serialize_engine_to_file(engine, engine_path)
 
-# # Deserialize saved engine from file
-# engine_2 = common.deserialize_engine_from_file(engine_path=engine_path, logger=TRT_LOGGER)
-# # Allocate input, output on host memory and GPU device memory
-# inputs_2, outputs_2, bindings_2, stream_2 = common.allocate_buffers(engine_2) #Return list of inputs/outputs host_device_memory(buffer) devicebindingsbuffers, cuda stream
-# # Create execution context from engine
-# context_2 = engine_2.create_execution_context()
-# # # Load input array to host memory
-# bboxes  = np.random.rand(4, 3, 128, 64).ravel()
-# np.copyto(inputs_2[0].host, bboxes)
-# # # Do inferences
-# [output_2]= common.do_inference(context_2, bindings=bindings_2, inputs=inputs_2, outputs=outputs_2, stream=stream_2, batch_size=4)
-# print(output_2.shape)
+# Deserialize saved engine from file
+engine_2 = common.deserialize_engine_from_file(engine_path=engine_path, logger=TRT_LOGGER)
+# Allocate input, output on host memory and GPU device memory
+inputs_2, outputs_2, bindings_2, stream_2 = common.allocate_buffers(engine_2) #Return list of inputs/outputs host_device_memory(buffer) devicebindingsbuffers, cuda stream
+# Create execution context from engine
+context_2 = engine_2.create_execution_context()
+# # Load input array to host memory
+bboxes  = np.random.rand(4, 3, 128, 64).ravel()
+np.copyto(inputs_2[0].host, bboxes)
+# # Do inferences
+[out]= common.do_inference(context_2, bindings=bindings_2, inputs=inputs_2, outputs=outputs_2, stream=stream_2, batch_size=4)
+

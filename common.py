@@ -155,6 +155,7 @@ def allocate_buffers(engine):
     bindings = []
     stream = cuda.Stream()
     for binding in engine:
+        print(binding)
         size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
         dtype = trt.nptype(engine.get_binding_dtype(binding))
         # Allocate host and device buffers
@@ -201,9 +202,9 @@ def serialize_engine_to_file(engine, file_path):
     with open(file_path, 'wb') as f:
         f.write(engine.serialize())
 
-def deserialize_engine_from_file(file_path, runtime):
-    
-    with open(file_path, 'rb') as f:
-        engine = runtime.deserialize_cuda_engine(f.read())
-    
-    return engine
+def deserialize_engine_from_file(engine_path, logger):
+    with open(engine_path, 'rb') as f:
+        serialized_engine = f.read()
+        with trt.Runtime(logger) as runtime:
+            engine = runtime.deserialize_cuda_engine(serialized_engine)
+            return engine
