@@ -69,8 +69,9 @@ class ImageEncoder(object):
         self.feature_dim = 128
         self.image_shape = (128, 64, 3)
 
-    def __call__(self, bboxes, batch_size=32):
-        np.copyto(self.inputs[0].host, bboxes)
+    def __call__(self, patches, batch_size=32):
+        np.copyto(self.inputs[0].host, patches.ravel())
+        print(self.inputs[0].host)
         # # Do inferences
         [out]= common.do_inference(self.context, bindings=self.bindings, inputs=self.inputs, outputs=self.outputs, stream=self.stream, batch_size=4)
         return out
@@ -84,13 +85,10 @@ def create_box_encoder(model_filename, logger, batch_size=32):
         image_patches = []
         for box in boxes:
             patch = extract_image_patch(image, box, image_shape[:2])
-            if patch is None:
-                print("WARNING: Failed to extract image patch: %s." % str(box))
-                patch = np.random.uniform(
-                    0., 255., image_shape).astype(np.uint8)
-            print(patch.shape)
+            patch = np.transpose(patch, (2,0,1))
             image_patches.append(patch)
         image_patches = np.asarray(image_patches)
+        print(image_patches.shape)
         return image_encoder(image_patches, batch_size)
 
     return encoder

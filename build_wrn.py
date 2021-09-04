@@ -224,3 +224,4 @@ np.copyto(inputs_2[0].host, bboxes)
 # # Do inferences
 [out]= common.do_inference(context_2, bindings=bindings_2, inputs=inputs_2, outputs=outputs_2, stream=stream_2, batch_size=4)
 
+print(out)
